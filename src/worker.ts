@@ -1,12 +1,20 @@
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { CanvasClient } from "./canvas/client.js";
+import { createSharedState } from "./mcp/context.js";
 import { createCanvasMcpServer } from "./mcp/server.js";
 
 export interface Env {
   CANVAS_TOKEN: string;
   CANVAS_BASE_URL?: string;
   ACCESS_PASSPHRASE: string;
+  /** IANA zone for displayed dates; defaults to America/New_York. */
+  CANVAS_TIME_ZONE?: string;
 }
+
+// Module scope survives across requests within a Worker isolate, so the
+// course list and per-course search index get reused between tool calls
+// instead of being rebuilt by every stateless request.
+const shared = createSharedState();
 
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
@@ -71,7 +79,7 @@ export default {
       baseUrl: env.CANVAS_BASE_URL ?? "https://uc.instructure.com/api/v1",
       token: env.CANVAS_TOKEN,
     });
-    const server = createCanvasMcpServer(client);
+    const server = createCanvasMcpServer(client, { shared, timeZone: env.CANVAS_TIME_ZONE });
 
     // Stateless mode: a fresh transport per request, no session tracking.
     const transport = new WebStandardStreamableHTTPServerTransport({

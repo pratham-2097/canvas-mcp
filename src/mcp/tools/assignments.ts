@@ -1,9 +1,11 @@
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { getAssignment, listActiveCourses, listCourseAssignments } from "../../canvas/endpoints.js";
-import { extractLinks, htmlToMarkdown } from "../../canvas/html.js";
+import { getAssignment, listCourseAssignments } from "../../canvas/endpoints.js";
+import { extractLinks, htmlToMarkdown, type ResolvedLink } from "../../canvas/html.js";
+import type { CanvasAssignment, CanvasRubricCriterion, CanvasSubmissionDetail } from "../../canvas/types.js";
 import type { ServerContext } from "../context.js";
-import { textResult } from "../shared.js";
+import { fmtDate, mapLimit, num, oneLine } from "../format.js";
+import type { ToolRegistry } from "../registry.js";
+import { courseArg, optionalCourseArg } from "../shared.js";
 
 function similarity(query: string, candidate: string): number {
   const q = query.toLowerCase();
@@ -17,94 +19,101 @@ function similarity(query: string, candidate: string): number {
   return (matched.length / Math.max(qTokens.length, 1)) * 60;
 }
 
-export function registerAssignmentTools(server: McpServer, ctx: ServerContext): void {
-  server.registerTool(
-    "find_assignment",
-    {
-      title: "Find Assignment",
-      description:
-        "Fuzzy-match an assignment name across one or all courses (e.g. 'Project 1'). Returns candidates ranked by match quality with their course_id and assignment_id, for use with get_assignment or gather_assignment_context.",
-      inputSchema: z.object({
-        query: z.string().describe("Assignment name or partial name to search for"),
-        course_id: z.number().int().optional().describe("Restrict search to a single course"),
-      }),
-      annotations: { readOnlyHint: true, destructiveHint: false },
-    },
-    async ({ query, course_id }) => {
-      const courses = course_id
-        ? [{ id: course_id, name: "", course_code: "", workflow_state: "" }]
-        : await listActiveCourses(ctx.client);
+/** One line per criterion, ratings inline: far smaller than the raw JSON and just as usable. */
+export function renderRubric(rubric: CanvasRubricCriterion[] | undefined, assessment?: CanvasSubmissionDetail["rubric_assessment"]): string {
+  if (!rubric?.length) return "";
+  const lines = ["## Rubric"];
+  for (const c of rubric) {
+    const ratings = (c.ratings ?? []).map((r) => `${num(r.points)} ${oneLine(r.description, 40)}`).join(" | ");
+    const got = assessment?.[c.id];
+    const score = got && got.points !== null && got.points !== undefined ? ` → you got ${num(got.points)}` : "";
+    const detail = c.long_description ? ` — ${oneLine(htmlToMarkdown(c.long_description), 200)}` : "";
+    lines.push(`- ${oneLine(c.description, 80)} (${num(c.points)} pts)${score}${detail}${ratings ? `\n  ratings: ${ratings}` : ""}${got?.comments ? `\n  grader: ${oneLine(got.comments, 300)}` : ""}`);
+  }
+  return lines.join("\n");
+}
 
-      const candidates: Array<{ score: number; name: string; course_id: number; assignment_id: number; html_url: string; due_at: string | null }> = [];
+export function renderLinks(links: ResolvedLink[]): string {
+  if (links.length === 0) return "";
+  const seen = new Set<string>();
+  const lines = links
+    .filter((l) => !seen.has(l.href) && seen.add(l.href))
+    .map((l) => {
+      if (l.kind === "file") return `- file: ${l.text} (file_id=${l.fileId})`;
+      if (l.kind === "page") return `- page: ${l.text} (page_url=${l.pageUrl})`;
+      return `- external: ${l.text} ${l.href}`;
+    });
+  return ["## Links in description", ...lines].join("\n");
+}
 
-      for (const course of courses) {
-        const assignments = await listCourseAssignments(ctx.client, course.id).catch(() => []);
-        for (const a of assignments) {
-          const score = similarity(query, a.name);
-          if (score > 20) {
-            candidates.push({ score, name: a.name, course_id: course.id, assignment_id: a.id, html_url: a.html_url, due_at: a.due_at });
-          }
-        }
-      }
+export function assignmentHeader(a: CanvasAssignment, courseId: number, timeZone: string): string {
+  const attempts = a.allowed_attempts && a.allowed_attempts > 0 ? ` · ${a.allowed_attempts} attempt(s) allowed` : "";
+  const window = a.unlock_at || a.lock_at ? `\navailable ${a.unlock_at ? fmtDate(a.unlock_at, timeZone) : "now"} → ${a.lock_at ? fmtDate(a.lock_at, timeZone) : "no close date"}` : "";
+  const types = a.submission_types.join(", ") + (a.allowed_extensions?.length ? ` (${a.allowed_extensions.join(", ")})` : "");
+  return [
+    `# ${a.name}`,
+    `course_id=${courseId} assignment_id=${a.id} · ${a.html_url}`,
+    `due ${fmtDate(a.due_at, timeZone)} · ${num(a.points_possible)} pts · submit via ${types}${attempts}${a.peer_reviews ? " · peer reviewed" : ""}${a.group_category_id ? " · group assignment" : ""}${window}`,
+    a.locked_for_user && a.lock_explanation ? `Locked: ${oneLine(htmlToMarkdown(a.lock_explanation), 200)}` : "",
+  ].filter(Boolean).join("\n");
+}
 
-      candidates.sort((a, b) => b.score - a.score);
-      const top = candidates.slice(0, 15);
+function submissionSection(s: CanvasSubmissionDetail | null, points: number | null, timeZone: string): string {
+  if (!s) return "## Your submission\n(not visible)";
+  const status = s.excused ? "excused"
+    : s.score !== null && s.score !== undefined ? `graded ${num(s.score)}/${num(points)}${s.grade && s.grade !== String(s.score) ? ` (${s.grade})` : ""}`
+    : s.workflow_state === "graded" && !s.posted_at ? "graded, not posted yet"
+    : s.submitted_at ? `submitted ${fmtDate(s.submitted_at, timeZone)}, not graded`
+    : s.missing ? "MISSING" : "not submitted";
+  const flags = [s.late ? "late" : "", s.points_deducted ? `-${num(s.points_deducted)} late penalty` : "", s.attempt ? `attempt ${s.attempt}` : ""].filter(Boolean).join(" · ");
+  const comments = (s.submission_comments ?? []).map((c) => `- ${c.author_name} (${fmtDate(c.created_at, timeZone)}): ${oneLine(c.comment, 500)}`);
+  return ["## Your submission", `${status}${flags ? ` · ${flags}` : ""}`, ...(comments.length ? ["Comments:", ...comments] : [])].join("\n");
+}
 
-      if (top.length === 0) {
-        return textResult(`No assignments matched "${query}".`);
-      }
+export async function loadAssignmentWithSubmission(ctx: ServerContext, courseId: number, assignmentId: number) {
+  const [a, submission] = await Promise.all([
+    getAssignment(ctx.client, courseId, assignmentId),
+    ctx.client
+      .get<CanvasSubmissionDetail>(`/courses/${courseId}/assignments/${assignmentId}/submissions/self`, { include: ["submission_comments", "rubric_assessment"] })
+      .catch(() => null),
+  ]);
+  return { a, submission };
+}
 
-      const lines = top.map(
-        (c) => `- ${c.name} (course_id=${c.course_id}, assignment_id=${c.assignment_id}) due=${c.due_at ?? "no due date"}\n  ${c.html_url}`,
-      );
-      return textResult(`${top.length} match(es) for "${query}":\n${lines.join("\n")}`);
-    },
-  );
-
-  server.registerTool(
-    "get_assignment",
-    {
-      title: "Get Assignment",
-      description:
-        "Get full details for one assignment: markdown description, rubric, dates, submission types, and resolved links found in the description.",
-      inputSchema: z.object({
-        course_id: z.number().int(),
-        assignment_id: z.number().int(),
-      }),
-      annotations: { readOnlyHint: true, destructiveHint: false },
-    },
-    async ({ course_id, assignment_id }) => {
-      const a = await getAssignment(ctx.client, course_id, assignment_id);
-      const markdown = htmlToMarkdown(a.description ?? "");
-      const links = extractLinks(a.description ?? "");
-
-      const linkLines = links.map((l) => {
-        if (l.kind === "file") return `  - file: ${l.text} (file_id=${l.fileId}) ${l.href}`;
-        if (l.kind === "page") return `  - page: ${l.text} (page_url=${l.pageUrl}) ${l.href}`;
-        return `  - external resource: ${l.text} ${l.href}`;
+export function registerAssignmentTools(reg: ToolRegistry, ctx: ServerContext): void {
+  reg.add({
+    name: "find_assignment",
+    description: "Fuzzy-find an assignment by name (e.g. 'Project 1') across all courses or one. Returns ids for get_assignment / gather_assignment_context.",
+    input: { query: z.string(), course_id: optionalCourseArg },
+    run: async ({ query, course_id }) => {
+      const courseIds = course_id !== undefined ? [await ctx.resolveCourseId(course_id)] : (await ctx.listCourses()).map((c) => c.id);
+      const perCourse = await mapLimit(courseIds, 6, async (id) => {
+        const assignments = await listCourseAssignments(ctx.client, id).catch(() => [] as CanvasAssignment[]);
+        return assignments.map((a) => ({ score: similarity(query, a.name), a, courseId: id }));
       });
-
-      const parts = [
-        `# ${a.name}`,
-        `course_id=${course_id} assignment_id=${assignment_id}`,
-        `due_at: ${a.due_at ?? "no due date"}`,
-        `points_possible: ${a.points_possible ?? "n/a"}`,
-        `submission_types: ${a.submission_types.join(", ")}`,
-        `html_url: ${a.html_url}`,
-        "",
-        "## Description",
-        markdown || "(no description)",
-      ];
-
-      if (links.length > 0) {
-        parts.push("", "## Links found in description", ...linkLines);
-      }
-
-      if (a.rubric && Array.isArray(a.rubric) && a.rubric.length > 0) {
-        parts.push("", "## Rubric", "```json", JSON.stringify(a.rubric, null, 2), "```");
-      }
-
-      return textResult(parts.join("\n"));
+      const top = perCourse.flat().filter((c) => c.score > 20).sort((x, y) => y.score - x.score).slice(0, 10);
+      if (top.length === 0) return `No assignments matched "${query}".`;
+      const lines = await Promise.all(
+        top.map(async ({ a, courseId }) => `- ${a.name} · ${await ctx.courseLabel(courseId)} · due ${fmtDate(a.due_at, ctx.timeZone)} (course_id=${courseId} assignment_id=${a.id})`),
+      );
+      return `${top.length} match(es) for "${query}":\n${lines.join("\n")}`;
     },
-  );
+  });
+
+  reg.add({
+    name: "get_assignment",
+    description: "One assignment in full: description, dates, rubric, links, plus your submission status, score, attempts, grader comments and rubric scores.",
+    input: { course_id: courseArg, assignment_id: z.number() },
+    run: async ({ course_id, assignment_id }) => {
+      const courseId = await ctx.resolveCourseId(course_id);
+      const { a, submission } = await loadAssignmentWithSubmission(ctx, courseId, assignment_id);
+      return [
+        assignmentHeader(a, courseId, ctx.timeZone),
+        submissionSection(submission, a.points_possible, ctx.timeZone),
+        `## Description\n${htmlToMarkdown(a.description ?? "") || "(no description)"}`,
+        renderLinks(extractLinks(a.description ?? "")),
+        renderRubric(a.rubric, submission?.rubric_assessment),
+      ].filter(Boolean).join("\n\n");
+    },
+  });
 }

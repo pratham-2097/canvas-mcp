@@ -11,64 +11,59 @@ import {
 } from "../canvas/endpoints.js";
 import { extractLinks, htmlToMarkdown } from "../canvas/html.js";
 import { extractFileText } from "../extract/index.js";
+import { mapLimit } from "../mcp/format.js";
 import type { CourseIndex, IndexedDocument } from "./types.js";
 
 const MAX_FILE_FETCH_BYTES = 25 * 1024 * 1024;
+const CONCURRENCY = 6;
 
-async function fetchAndExtractFile(
-  client: CanvasClient,
-  fileId: number,
-): Promise<{ text: string; note?: string; filename: string; html_url: string; updated_at: string } | undefined> {
+export interface CrawlOptions {
+  /** Earlier index of the same course: its extracted file text is reused instead of re-downloaded. */
+  previous?: CourseIndex;
+  /** Stop starting new file extractions after this many ms; the rest stay pending for the next crawl. */
+  fileBudgetMs?: number;
+}
+
+type FileOutcome = { doc: IndexedDocument } | { pending: true } | { failed: true };
+
+async function fetchAndExtractFile(client: CanvasClient, courseId: number, fileId: number): Promise<FileOutcome> {
   try {
     const meta = await getFile(client, fileId);
-    if (meta.size > MAX_FILE_FETCH_BYTES) {
-      return { text: "", note: "file exceeds 25MB, not extracted", filename: meta.filename, html_url: meta.url, updated_at: meta.updated_at };
-    }
+    const base = { id: `file-${fileId}`, course_id: courseId, type: "file" as const, title: meta.filename, html_url: meta.url, updated_at: meta.updated_at };
+    if (meta.size > MAX_FILE_FETCH_BYTES) return { doc: { ...base, text: "[file exceeds 25MB, not extracted]" } };
     const download = await client.getBytes(meta.url);
-    if (!download.ok) return undefined;
+    if (!download.ok) return { failed: true };
     const result = await extractFileText(meta.filename, meta["content-type"], download.bytes);
-    return { text: result.text, note: result.note, filename: meta.filename, html_url: meta.url, updated_at: meta.updated_at };
-  } catch {
-    return undefined;
+    return { doc: { ...base, text: result.note ? `[${result.note}]` : result.text } };
+  } catch (err) {
+    // Workers cap subrequests per invocation; a file that hit the cap is
+    // retried on the next crawl rather than dropped.
+    return /subrequest/i.test((err as Error).message) ? { pending: true } : { failed: true };
   }
 }
 
 /**
  * Crawls everything a Canvas course exposes and builds a flat document index.
  * Files are discovered by extracting links out of HTML bodies (descriptions,
- * pages, announcements, discussions) rather than listing /files, since that
- * endpoint is frequently 403'd for students even though individual file ids
- * discovered elsewhere are readable.
+ * pages, announcements, discussions) and from modules, rather than listing
+ * /files, since that endpoint is frequently 403'd for students even though
+ * individual file ids discovered elsewhere are readable.
+ *
+ * Listings and page bodies are fetched concurrently; files are extracted
+ * concurrently within a time budget. Files left over are counted in
+ * `pending_files` and picked up by the next crawl, which reuses text already
+ * extracted, so a large course is indexed incrementally instead of timing out.
  */
-export async function crawlCourse(client: CanvasClient, courseId: number): Promise<CourseIndex> {
+export async function crawlCourse(client: CanvasClient, courseId: number, options: CrawlOptions = {}): Promise<CourseIndex> {
   const documents: IndexedDocument[] = [];
-  const seenFileIds = new Set<number>();
+  const fileIds = new Set<number>();
+  const now = new Date().toISOString();
 
-  async function indexFileIfNew(fileId: number) {
-    if (seenFileIds.has(fileId)) return;
-    seenFileIds.add(fileId);
-    const extracted = await fetchAndExtractFile(client, fileId);
-    if (!extracted) return;
-    documents.push({
-      id: `file-${fileId}`,
-      course_id: courseId,
-      type: "file",
-      title: extracted.filename,
-      html_url: extracted.html_url,
-      text: extracted.note ? `[${extracted.note}]` : extracted.text,
-      updated_at: extracted.updated_at,
-    });
-  }
-
-  async function harvestLinks(html: string | null | undefined) {
-    if (!html) return;
-    const links = extractLinks(html);
-    for (const link of links) {
-      if (link.kind === "file" && link.fileId) {
-        await indexFileIfNew(link.fileId);
-      }
+  const harvestLinks = (html: string | null | undefined) => {
+    for (const link of extractLinks(html ?? "")) {
+      if (link.kind === "file" && link.fileId) fileIds.add(link.fileId);
     }
-  }
+  };
 
   const [course, assignments, modules, pages, announcements, discussions] = await Promise.all([
     getCourseWithSyllabus(client, courseId).catch(() => undefined),
@@ -87,17 +82,15 @@ export async function crawlCourse(client: CanvasClient, courseId: number): Promi
       title: `${course.name} — Syllabus`,
       html_url: `https://uc.instructure.com/courses/${courseId}/assignments/syllabus`,
       text: htmlToMarkdown(course.syllabus_body),
-      updated_at: new Date().toISOString(),
+      updated_at: now,
     });
-    await harvestLinks(course.syllabus_body);
+    harvestLinks(course.syllabus_body);
   }
 
-  const moduleNameByItemId = new Map<number, string>();
   for (const mod of modules) {
     for (const item of mod.items ?? []) {
-      moduleNameByItemId.set(item.id, mod.name);
       if (item.type === "File" && typeof item.content_id === "number") {
-        await indexFileIfNew(item.content_id);
+        fileIds.add(item.content_id);
       } else {
         documents.push({
           id: `module_item-${item.id}`,
@@ -107,7 +100,7 @@ export async function crawlCourse(client: CanvasClient, courseId: number): Promi
           html_url: item.html_url,
           module: mod.name,
           text: `${item.type}: ${item.title}`,
-          updated_at: new Date().toISOString(),
+          updated_at: now,
         });
       }
     }
@@ -121,16 +114,16 @@ export async function crawlCourse(client: CanvasClient, courseId: number): Promi
       title: a.name,
       html_url: a.html_url,
       text: `${a.name}\n\n${htmlToMarkdown(a.description ?? "")}`,
-      updated_at: new Date().toISOString(),
+      updated_at: now,
     });
-    await harvestLinks(a.description);
+    harvestLinks(a.description);
   }
 
-  for (const p of pages) {
-    const full = await getPage(client, courseId, p.url).catch(() => undefined);
-    const body = full?.body ?? "";
+  const pageBodies = await mapLimit(pages, CONCURRENCY, (p) => getPage(client, courseId, p.url).then((full) => full.body ?? "").catch(() => ""));
+  pages.forEach((p, i) => {
+    const body = pageBodies[i] ?? "";
     documents.push({
-      id: `page-${p.page_id}`,
+      id: `page-${p.url}`,
       course_id: courseId,
       type: "page",
       title: p.title,
@@ -138,8 +131,8 @@ export async function crawlCourse(client: CanvasClient, courseId: number): Promi
       text: `${p.title}\n\n${htmlToMarkdown(body)}`,
       updated_at: p.updated_at,
     });
-    await harvestLinks(body);
-  }
+    harvestLinks(body);
+  });
 
   for (const ann of announcements) {
     documents.push({
@@ -151,7 +144,7 @@ export async function crawlCourse(client: CanvasClient, courseId: number): Promi
       text: `${ann.title}\n\n${htmlToMarkdown(ann.message ?? "")}`,
       updated_at: ann.posted_at,
     });
-    await harvestLinks(ann.message);
+    harvestLinks(ann.message);
   }
 
   for (const d of discussions) {
@@ -162,10 +155,26 @@ export async function crawlCourse(client: CanvasClient, courseId: number): Promi
       title: d.title,
       html_url: d.html_url,
       text: `${d.title}\n\n${htmlToMarkdown(d.message ?? "")}`,
-      updated_at: d.posted_at ?? new Date().toISOString(),
+      updated_at: d.posted_at ?? now,
     });
-    await harvestLinks(d.message);
+    harvestLinks(d.message);
   }
 
-  return { course_id: courseId, documents, indexed_at: Date.now() };
+  const previousFiles = new Map(
+    (options.previous?.documents ?? []).filter((d) => d.type === "file").map((d) => [d.id, d]),
+  );
+  const deadline = Date.now() + (options.fileBudgetMs ?? Number.POSITIVE_INFINITY);
+  let pending = 0;
+  const outcomes = await mapLimit([...fileIds], CONCURRENCY, async (fileId): Promise<FileOutcome> => {
+    const cached = previousFiles.get(`file-${fileId}`);
+    if (cached) return { doc: cached };
+    if (Date.now() > deadline) return { pending: true };
+    return fetchAndExtractFile(client, courseId, fileId);
+  });
+  for (const outcome of outcomes) {
+    if ("doc" in outcome) documents.push(outcome.doc);
+    else if ("pending" in outcome) pending++;
+  }
+
+  return { course_id: courseId, documents, indexed_at: Date.now(), pending_files: pending };
 }

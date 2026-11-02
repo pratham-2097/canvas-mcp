@@ -21,7 +21,7 @@ function loadDevVars(path = ".dev.vars"): void {
 async function main() {
   loadDevVars();
   const client = createCanvasClientFromEnv(process.env);
-  const server = createCanvasMcpServer(client);
+  const server = createCanvasMcpServer(client, { timeZone: process.env.CANVAS_TIME_ZONE });
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }

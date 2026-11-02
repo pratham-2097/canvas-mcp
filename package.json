@@ -1,15 +1,19 @@
 {
   "name": "canvas-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Personal read-only remote MCP server for Canvas LMS (University of Cincinnati)",
+  "description": "Personal read-only remote MCP server for Canvas LMS (University of Cincinnati): every student read feature, token-lean",
   "scripts": {
     "dev:stdio": "tsx src/stdio.ts",
     "inspector": "npx @modelcontextprotocol/inspector tsx src/stdio.ts",
     "build": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "footprint": "tsx scripts/tool-footprint.ts",
+    "call": "tsx scripts/call.ts",
+    "check:live": "tsx scripts/live-check.ts",
+    "check:remote": "tsx scripts/live-check.ts",
     "wrangler:dev": "wrangler dev",
     "deploy": "wrangler deploy"
   },

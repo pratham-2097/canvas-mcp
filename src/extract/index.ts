@@ -31,7 +31,8 @@ function okResult(text: string): ExtractionResult {
 
 async function extractPdf(bytes: Uint8Array): Promise<ExtractionResult> {
   try {
-    const pdf = await getDocumentProxy(bytes);
+    // verbosity 0: pdf.js otherwise logs a warning per unusual font glyph.
+    const pdf = await getDocumentProxy(bytes, { verbosity: 0 });
     const { text } = await extractText(pdf, { mergePages: true });
     return okResult(Array.isArray(text) ? text.join("\n") : text);
   } catch (err) {
