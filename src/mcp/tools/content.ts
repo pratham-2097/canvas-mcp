@@ -1,109 +1,84 @@
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { getCourseWithSyllabus, getFile, getPage, listAnnouncements, listModules } from "../../canvas/endpoints.js";
+import { CanvasApiError } from "../../canvas/client.js";
+import { getCourseWithSyllabus, getFrontPage, getPage, listModules, listPages } from "../../canvas/endpoints.js";
 import { htmlToMarkdown } from "../../canvas/html.js";
-import { extractFileText } from "../../extract/index.js";
+import type { CanvasModuleItem } from "../../canvas/types.js";
 import type { ServerContext } from "../context.js";
-import { textResult } from "../shared.js";
+import { fmtDate, num, oneLine } from "../format.js";
+import type { ToolRegistry } from "../registry.js";
+import { courseArg } from "../shared.js";
 
-export function registerContentTools(server: McpServer, ctx: ServerContext): void {
-  server.registerTool(
-    "list_modules",
-    {
-      title: "List Modules",
-      description: "List a course's modules with their items, in order. Useful to see what an assignment is near.",
-      inputSchema: z.object({ course_id: z.number().int() }),
-      annotations: { readOnlyHint: true, destructiveHint: false },
-    },
-    async ({ course_id }) => {
-      const modules = await listModules(ctx.client, course_id);
-      const lines = modules.map((m) => {
-        const items = (m.items ?? [])
-          .map((i) => `    - [${i.type}] ${i.title} ${i.html_url}`)
-          .join("\n");
-        return `- Module: ${m.name}\n${items}`;
+/** The id a follow-up tool needs for this item, so the model never has to parse a URL. */
+function itemRef(i: CanvasModuleItem): string {
+  switch (i.type) {
+    case "Assignment":
+      return `assignment_id=${i.content_id}`;
+    case "Quiz":
+      return `quiz_id=${i.content_id}`;
+    case "Discussion":
+      return `topic_id=${i.content_id}`;
+    case "File":
+      return `file_id=${i.content_id}`;
+    case "Page":
+      return `page_url=${i.page_url}`;
+    case "ExternalUrl":
+    case "ExternalTool":
+      return i.external_url ?? "";
+    default:
+      return "";
+  }
+}
+
+export function registerContentTools(reg: ToolRegistry, ctx: ServerContext): void {
+  reg.add({
+    name: "list_modules",
+    description: "A course's modules in order with each item's type, id, due date and your completion status. Use to see course structure or what's left in a module.",
+    input: { course_id: courseArg, module_name: z.string().optional().describe("Only modules whose name contains this") },
+    run: async ({ course_id, module_name }) => {
+      const courseId = await ctx.resolveCourseId(course_id);
+      let modules = await listModules(ctx.client, courseId);
+      if (module_name) modules = modules.filter((m) => m.name.toLowerCase().includes(module_name.toLowerCase()));
+      if (modules.length === 0) return module_name ? `No module name contains "${module_name}".` : "No modules found.";
+      const blocks = modules.map((m) => {
+        const state = m.state && m.state !== "unlocked" ? ` [${m.state}${m.state === "locked" && m.unlock_at ? ` until ${fmtDate(m.unlock_at, ctx.timeZone)}` : ""}]` : "";
+        const items = (m.items ?? []).map((i) => {
+          if (i.type === "SubHeader") return `  ${"  ".repeat(i.indent ?? 0)}### ${i.title}`;
+          const done = i.completion_requirement ? (i.completion_requirement.completed ? " ✓" : " ☐") : "";
+          const d = i.content_details;
+          const due = d?.due_at ? ` · due ${fmtDate(d.due_at, ctx.timeZone)}` : "";
+          const pts = d?.points_possible ? ` · ${num(d.points_possible)}pts` : "";
+          const ref = itemRef(i);
+          return `  ${"  ".repeat(i.indent ?? 0)}-${done} [${i.type}] ${oneLine(i.title, 100)}${due}${pts}${ref ? ` (${ref})` : ""}`;
+        });
+        return `## ${m.name}${state}\n${items.join("\n") || "  (empty)"}`;
       });
-      return textResult(lines.join("\n\n") || "No modules found.");
+      return `course_id=${courseId}\n${blocks.join("\n")}`;
     },
-  );
+  });
 
-  server.registerTool(
-    "get_page",
-    {
-      title: "Get Page",
-      description: "Get a course wiki page's content as markdown, by its page url slug (from list_modules or a link).",
-      inputSchema: z.object({ course_id: z.number().int(), page_url: z.string() }),
-      annotations: { readOnlyHint: true, destructiveHint: false },
-    },
-    async ({ course_id, page_url }) => {
-      const page = await getPage(ctx.client, course_id, page_url);
-      return textResult(`# ${page.title}\n${page.html_url}\n\n${htmlToMarkdown(page.body ?? "")}`);
-    },
-  );
-
-  server.registerTool(
-    "get_file_text",
-    {
-      title: "Get File Text",
-      description: "Download a Canvas file by id and extract its text (PDF, DOCX, PPTX, or plain text/code).",
-      inputSchema: z.object({ file_id: z.number().int() }),
-      annotations: { readOnlyHint: true, destructiveHint: false },
-    },
-    async ({ file_id }) => {
-      const meta = await getFile(ctx.client, file_id);
-      const download = await ctx.client.getBytes(meta.url);
-      if (!download.ok) {
-        return textResult(`Could not download file ${file_id} (${meta.filename}): HTTP ${download.status}`);
+  reg.add({
+    name: "get_page",
+    description: "Read a course page as markdown. page_url: a page slug, 'front_page', or 'syllabus'. Omit page_url to list all pages.",
+    input: { course_id: courseArg, page_url: z.string().optional() },
+    run: async ({ course_id, page_url }) => {
+      const courseId = await ctx.resolveCourseId(course_id);
+      if (!page_url) {
+        const pages = await listPages(ctx.client, courseId).catch((err) => {
+          // Canvas 404s the page list when a course disables its Pages tab.
+          if (err instanceof CanvasApiError && (err.status === 404 || err.status === 403)) return [];
+          throw err;
+        });
+        if (pages.length === 0) return "No pages listed (the Pages tab may be disabled). Try list_modules, or page_url='front_page' or 'syllabus'.";
+        const lines = pages.map((p) => `- ${oneLine(p.title, 100)} (page_url=${p.url}) · updated ${fmtDate(p.updated_at, ctx.timeZone)}`);
+        return `${pages.length} page(s):\n${lines.join("\n")}`;
       }
-      const result = await extractFileText(meta.filename, meta["content-type"], download.bytes);
-      const header = `# ${meta.filename}\n${meta.url}\nstatus: ${result.status}${result.note ? ` (${result.note})` : ""}\n\n`;
-      return textResult(header + result.text);
+      if (page_url === "syllabus") {
+        const course = await getCourseWithSyllabus(ctx.client, courseId);
+        if (!course.syllabus_body) return "This course has no syllabus body set. Try search_course for 'syllabus' (it may be a file or page).";
+        return `# ${course.name} — Syllabus\n\n${htmlToMarkdown(course.syllabus_body)}`;
+      }
+      const page = page_url === "front_page" ? await getFrontPage(ctx.client, courseId) : await getPage(ctx.client, courseId, page_url);
+      return `# ${page.title}\n${page.html_url}\n\n${htmlToMarkdown(page.body ?? "")}`;
     },
-  );
-
-  server.registerTool(
-    "list_announcements",
-    {
-      title: "List Announcements",
-      description: "List a course's announcements, optionally since a given date, newest first.",
-      inputSchema: z.object({ course_id: z.number().int(), since: z.string().optional() }),
-      annotations: { readOnlyHint: true, destructiveHint: false },
-    },
-    async ({ course_id, since }) => {
-      const announcements = await listAnnouncements(ctx.client, course_id, since);
-      const lines = announcements.map(
-        (a) => `- ${a.title} (posted ${a.posted_at})\n  ${a.html_url}\n  ${htmlToMarkdown(a.message ?? "").slice(0, 300)}`,
-      );
-      return textResult(lines.join("\n\n") || "No announcements found.");
-    },
-  );
-
-  server.registerTool(
-    "get_syllabus",
-    {
-      title: "Get Syllabus",
-      description: "Get a course's syllabus body as markdown.",
-      inputSchema: z.object({ course_id: z.number().int() }),
-      annotations: { readOnlyHint: true, destructiveHint: false },
-    },
-    async ({ course_id }) => {
-      const course = await getCourseWithSyllabus(ctx.client, course_id);
-      if (!course.syllabus_body) return textResult("This course has no syllabus body set.");
-      return textResult(`# ${course.name} — Syllabus\n\n${htmlToMarkdown(course.syllabus_body)}`);
-    },
-  );
-
-  server.registerTool(
-    "refresh_course_index",
-    {
-      title: "Refresh Course Index",
-      description: "Force a fresh crawl of a course's content (bypassing the 6h cache). Use if content seems stale.",
-      inputSchema: z.object({ course_id: z.number().int() }),
-      annotations: { readOnlyHint: true, destructiveHint: false },
-    },
-    async ({ course_id }) => {
-      const index = await ctx.indexManager.getIndex(course_id, true);
-      return textResult(`Refreshed index for course ${course_id}: ${index.documents.length} documents indexed.`);
-    },
-  );
+  });
 }

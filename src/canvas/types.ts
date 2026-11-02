@@ -9,6 +9,7 @@ export interface CanvasCourse {
   course_code: string;
   workflow_state: string;
   term?: CanvasTerm;
+  enrollments?: Array<{ type: string; role?: string }>;
 }
 
 export interface CanvasSubmission {
@@ -30,8 +31,34 @@ export interface CanvasAssignment {
   html_url: string;
   submission_types: string[];
   submission?: CanvasSubmission;
-  rubric?: unknown[];
+  rubric?: CanvasRubricCriterion[];
   rubric_settings?: unknown;
+  lock_at?: string | null;
+  unlock_at?: string | null;
+  allowed_attempts?: number;
+  allowed_extensions?: string[];
+  locked_for_user?: boolean;
+  lock_explanation?: string;
+  peer_reviews?: boolean;
+  group_category_id?: number | null;
+}
+
+export interface CanvasRubricCriterion {
+  id: string;
+  description: string;
+  long_description?: string | null;
+  points: number;
+  ratings?: Array<{ id: string; description: string; long_description?: string | null; points: number }>;
+}
+
+export interface CanvasSubmissionDetail extends CanvasSubmission {
+  attempt: number | null;
+  grade: string | null;
+  excused?: boolean;
+  points_deducted?: number | null;
+  posted_at?: string | null;
+  submission_comments?: Array<{ author_name: string; comment: string; created_at: string }>;
+  rubric_assessment?: Record<string, { points?: number | null; rating_id?: string | null; comments?: string | null }>;
 }
 
 export interface CanvasMissingSubmission extends CanvasAssignment {
@@ -45,8 +72,13 @@ export interface CanvasModuleItem {
   type: string;
   html_url: string;
   content_id?: number;
+  page_url?: string;
   url?: string;
+  external_url?: string;
   position: number;
+  indent?: number;
+  completion_requirement?: { type: string; completed?: boolean };
+  content_details?: { due_at?: string | null; points_possible?: number | null; locked_for_user?: boolean };
 }
 
 export interface CanvasModule {
@@ -54,6 +86,8 @@ export interface CanvasModule {
   name: string;
   position: number;
   items?: CanvasModuleItem[];
+  state?: string;
+  unlock_at?: string | null;
 }
 
 export interface CanvasPage {

@@ -1,146 +1,110 @@
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { getAssignment, getPage, listModules } from "../../canvas/endpoints.js";
+import { getPage, listModules } from "../../canvas/endpoints.js";
 import { extractLinks, htmlToMarkdown } from "../../canvas/html.js";
 import { extractFileText } from "../../extract/index.js";
 import type { ServerContext } from "../context.js";
-import { textResult } from "../shared.js";
+import { mapLimit, oneLine } from "../format.js";
+import type { ToolRegistry } from "../registry.js";
+import { courseArg } from "../shared.js";
+import { assignmentHeader, loadAssignmentWithSubmission, renderRubric } from "./assignments.js";
 
-export function registerGatherContextTool(server: McpServer, ctx: ServerContext): void {
-  server.registerTool(
-    "gather_assignment_context",
-    {
-      title: "Gather Assignment Context",
-      description:
-        "THE KEY TOOL for catching up on one assignment. Returns one structured bundle: the assignment's details, its module and neighboring items, linked pages and files (with extracted text), and search hits for the assignment's name across the whole course. Use this when the user asks 'what do I need for <assignment>'.",
-      inputSchema: z.object({
-        course_id: z.number().int(),
-        assignment_id: z.number().int(),
-      }),
-      annotations: { readOnlyHint: true, destructiveHint: false },
-    },
-    async ({ course_id, assignment_id }) => {
+// Extracting a file is the expensive part (and on the Workers free plan a
+// handful of PDFs in one request exceeds the CPU limit), so only the first
+// few are inlined; the rest are listed by id for get_file_text.
+const MAX_EXTRACTED_FILES = 2;
+const MAX_LINKED_PAGES = 6;
+
+export function registerGatherContextTool(reg: ToolRegistry, ctx: ServerContext): void {
+  reg.add({
+    name: "gather_assignment_context",
+    description:
+      "Everything needed to do one assignment in a single call: details, rubric, your submission, its module and neighboring items, text of linked files and pages, and mentions elsewhere in the course. Use for 'help me with <assignment>'.",
+    input: { course_id: courseArg, assignment_id: z.number() },
+    run: async ({ course_id, assignment_id }) => {
+      const courseId = await ctx.resolveCourseId(course_id);
+      const [{ a: assignment, submission }, modules] = await Promise.all([
+        loadAssignmentWithSubmission(ctx, courseId, assignment_id),
+        listModules(ctx.client, courseId).catch(() => []),
+      ]);
       const sections: string[] = [];
+      const status = submission
+        ? submission.score !== null && submission.score !== undefined
+          ? `Your score: ${submission.score}/${assignment.points_possible ?? "-"}`
+          : submission.submitted_at ? "You've submitted; not graded yet." : submission.missing ? "Status: MISSING" : "Status: not submitted"
+        : "";
+      sections.push([assignmentHeader(assignment, courseId, ctx.timeZone), status].filter(Boolean).join("\n"));
+      sections.push(`## Description\n${htmlToMarkdown(assignment.description ?? "") || "(no description)"}`);
+      const rubric = renderRubric(assignment.rubric, submission?.rubric_assessment);
+      if (rubric) sections.push(rubric);
 
-      const assignment = await getAssignment(ctx.client, course_id, assignment_id);
-      const descriptionMarkdown = htmlToMarkdown(assignment.description ?? "");
-      sections.push(
-        [
-          `# ${assignment.name}`,
-          `course_id=${course_id} assignment_id=${assignment_id}`,
-          `due_at: ${assignment.due_at ?? "no due date"}`,
-          `points_possible: ${assignment.points_possible ?? "n/a"}`,
-          `submission_types: ${assignment.submission_types.join(", ")}`,
-          `html_url: ${assignment.html_url}`,
-          "",
-          "## Description",
-          descriptionMarkdown || "(no description)",
-        ].join("\n"),
-      );
-
-      if (assignment.rubric && Array.isArray(assignment.rubric) && assignment.rubric.length > 0) {
-        sections.push(["## Rubric", "```json", JSON.stringify(assignment.rubric, null, 2), "```"].join("\n"));
-      }
-
-      // Module + neighboring items. The assignment's own content may be a
-      // module item directly (type Assignment), or its content may live on
-      // a linked Page item whose title names the assignment instead.
-      const modules = await listModules(ctx.client, course_id).catch(() => []);
-      let owningModule: { name: string; items: Array<{ id: number; title: string; type: string; html_url: string; content_id?: number }> } | undefined;
-      let matchedItemIndex = -1;
-
-      const assignmentNameLower = assignment.name.toLowerCase();
-      const coreName = assignmentNameLower.split(/[-:(]/)[0]?.trim() ?? assignmentNameLower;
-
+      // Module + neighbors. The assignment may be a module item itself, or its
+      // content may live on a Page item whose title names it.
+      const nameLower = assignment.name.toLowerCase();
+      const coreName = nameLower.split(/[-:(]/)[0]?.trim() ?? nameLower;
+      let owning: { name: string; items: NonNullable<(typeof modules)[number]["items"]>; idx: number } | undefined;
       for (const mod of modules) {
         const items = mod.items ?? [];
         let idx = items.findIndex((i) => i.content_id === assignment_id && i.type === "Assignment");
-        if (idx === -1 && coreName.length > 3) {
-          idx = items.findIndex((i) => i.title.toLowerCase().includes(coreName));
-        }
+        if (idx === -1 && coreName.length > 3) idx = items.findIndex((i) => i.title.toLowerCase().includes(coreName));
         if (idx !== -1) {
-          owningModule = { name: mod.name, items };
-          matchedItemIndex = idx;
+          owning = { name: mod.name, items, idx };
           break;
         }
       }
-
-      if (owningModule) {
-        const { name, items } = owningModule;
-        const start = Math.max(0, matchedItemIndex - 2);
-        const end = Math.min(items.length, matchedItemIndex + 3);
-        const neighbors = items.slice(start, end).map((item, i) => {
-          const marker = start + i === matchedItemIndex ? ">> " : "   ";
-          return `${marker}[${item.type}] ${item.title} ${item.html_url}`;
+      if (owning) {
+        const start = Math.max(0, owning.idx - 2);
+        const neighbors = owning.items.slice(start, owning.idx + 3).map((item, i) => {
+          const ref = item.type === "Page" ? ` (page_url=${item.page_url})` : item.type === "File" ? ` (file_id=${item.content_id})` : "";
+          return `${start + i === owning.idx ? ">>" : "  "} [${item.type}] ${item.title}${ref}`;
         });
-        sections.push(["## Module: " + name, ...neighbors].join("\n"));
-      } else {
-        sections.push("## Module\n(Could not locate this assignment in any module.)");
+        sections.push([`## Module: ${owning.name}`, ...neighbors].join("\n"));
       }
 
-      // Linked pages and files, with extracted text
       const links = extractLinks(assignment.description ?? "");
-      const fileLinks = links.filter((l) => l.kind === "file" && l.fileId);
-      const pageLinks = links.filter((l) => l.kind === "page" && l.pageUrl);
-      const externalLinks = links.filter((l) => l.kind === "external");
+      const allFileIds = [...new Set(links.filter((l) => l.kind === "file" && l.fileId).map((l) => l.fileId!))];
+      const fileIds = allFileIds.slice(0, MAX_EXTRACTED_FILES);
+      const moreFiles = links.filter((l) => l.kind === "file" && l.fileId && !fileIds.includes(l.fileId));
+      const pageLinks = links.filter((l) => l.kind === "page" && l.pageUrl).slice(0, MAX_LINKED_PAGES);
+      const external = links.filter((l) => l.kind === "external");
 
-      if (fileLinks.length > 0) {
-        const fileSections: string[] = [];
-        for (const link of fileLinks) {
+      const [files, pages, searchIndex] = await Promise.all([
+        mapLimit(fileIds, 3, async (fileId) => {
           try {
-            const meta = await ctx.client.get<{ filename: string; "content-type": string; url: string; size: number }>(`/files/${link.fileId}`);
-            if (meta.size > 25 * 1024 * 1024) {
-              fileSections.push(`### ${meta.filename}\n${meta.url}\n[file exceeds 25MB, not extracted]`);
-              continue;
-            }
+            const meta = await ctx.client.get<{ filename: string; "content-type": string; url: string; size: number }>(`/files/${fileId}`);
+            if (meta.size > 25 * 1024 * 1024) return `### ${meta.filename} (file_id=${fileId})\n[over 25MB, not extracted]`;
             const download = await ctx.client.getBytes(meta.url);
-            if (!download.ok) {
-              fileSections.push(`### ${link.text}\n${link.href}\n[could not download: HTTP ${download.status}]`);
-              continue;
-            }
+            if (!download.ok) return `### file_id=${fileId}\n[could not download: HTTP ${download.status}]`;
             const result = await extractFileText(meta.filename, meta["content-type"], download.bytes);
-            fileSections.push(
-              `### ${meta.filename}\n${meta.url}\n${result.status === "ok" ? result.text.slice(0, 3000) : `[${result.note}]`}`,
-            );
+            const text = result.status === "ok" ? result.text.slice(0, 3000) + (result.text.length > 3000 ? "\n…(more: get_file_text)" : "") : `[${result.note}]`;
+            return `### ${meta.filename} (file_id=${fileId})\n${text}`;
           } catch (err) {
-            fileSections.push(`### ${link.text}\n${link.href}\n[error: ${(err as Error).message}]`);
+            return `### file_id=${fileId}\n[error: ${(err as Error).message.slice(0, 150)}]`;
           }
-        }
-        sections.push(["## Linked files", ...fileSections].join("\n\n"));
-      }
-
-      if (pageLinks.length > 0) {
-        const pageSections: string[] = [];
-        for (const link of pageLinks) {
+        }),
+        mapLimit(pageLinks, 3, async (link) => {
           try {
-            const page = await getPage(ctx.client, link.courseId ?? course_id, link.pageUrl!);
-            pageSections.push(`### ${page.title}\n${page.html_url}\n${htmlToMarkdown(page.body ?? "").slice(0, 2000)}`);
+            const page = await getPage(ctx.client, link.courseId ?? courseId, link.pageUrl!);
+            return `### ${page.title} (page_url=${link.pageUrl})\n${htmlToMarkdown(page.body ?? "").slice(0, 2000)}`;
           } catch (err) {
-            pageSections.push(`### ${link.text}\n${link.href}\n[error: ${(err as Error).message}]`);
+            return `### ${link.text}\n[error: ${(err as Error).message.slice(0, 150)}]`;
           }
-        }
-        sections.push(["## Linked pages", ...pageSections].join("\n\n"));
+        }),
+        // Only an index that already exists: building one here could cost
+        // this whole bundle the Worker's per-request budget.
+        ctx.indexManager.getCachedSearchIndex(courseId).then((r) => r?.index ?? null).catch(() => null),
+      ]);
+      if (files.length) {
+        const rest = [...new Map(moreFiles.map((l) => [l.fileId, `- ${l.text} (file_id=${l.fileId}) — read with get_file_text`])).values()];
+        sections.push(["## Linked files", ...files, ...(rest.length ? [rest.join("\n")] : [])].join("\n\n"));
       }
+      if (pages.length) sections.push(["## Linked pages", ...pages].join("\n\n"));
+      if (external.length) sections.push(["## External links (not scraped)", ...external.map((l) => `- ${l.text} ${l.href}`)].join("\n"));
 
-      if (externalLinks.length > 0) {
-        const lines = externalLinks.map((l) => `- external resource: ${l.text} ${l.href}`);
-        sections.push(["## External resources (not scraped)", ...lines].join("\n"));
+      const hits = searchIndex?.search(assignment.name, { limit: 8 }).filter((h) => h.doc.id !== `assignment-${assignment_id}`) ?? [];
+      if (hits.length) {
+        sections.push(["## Mentions elsewhere in the course", ...hits.map((h) => `- [${h.doc.type}] ${h.doc.title} (${h.doc.id}): ${oneLine(h.text, 220)}`)].join("\n"));
       }
-
-      // Search hits for the assignment name across the course
-      const searchIndex = await ctx.indexManager.getSearchIndex(course_id);
-      const hits = searchIndex
-        .search(assignment.name, { limit: 10 })
-        .filter((h) => h.doc.id !== `assignment-${assignment_id}`);
-
-      if (hits.length > 0) {
-        const lines = hits.map(
-          (h) => `- [${h.doc.type}] ${h.doc.title} (score=${h.score.toFixed(2)}) ${h.doc.html_url}\n  ${h.text.slice(0, 250).replace(/\n+/g, " ")}`,
-        );
-        sections.push(["## Other mentions of this assignment across the course", ...lines].join("\n"));
-      }
-
-      return textResult(sections.join("\n\n---\n\n"));
+      return sections.join("\n\n---\n\n");
     },
-  );
+  });
 }

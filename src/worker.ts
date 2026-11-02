@@ -1,12 +1,27 @@
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { CanvasClient } from "./canvas/client.js";
+import { createSharedState } from "./mcp/context.js";
 import { createCanvasMcpServer } from "./mcp/server.js";
 
 export interface Env {
   CANVAS_TOKEN: string;
   CANVAS_BASE_URL?: string;
   ACCESS_PASSPHRASE: string;
+  /** IANA zone for displayed dates; defaults to America/New_York. */
+  CANVAS_TIME_ZONE?: string;
+  /**
+   * Files a single search call may extract into the index. Defaults to 0:
+   * on the Workers free plan (50 subrequests, ~10ms CPU per request) parsing
+   * a batch of PDFs gets the request killed (error 1102). On Workers Paid,
+   * set it to e.g. 40 to search inside file contents.
+   */
+  MAX_FILES_PER_CRAWL?: string;
 }
+
+// Module scope survives across requests within a Worker isolate, so the
+// course list and per-course search index get reused between tool calls
+// instead of being rebuilt by every stateless request.
+const shared = createSharedState();
 
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
@@ -71,7 +86,11 @@ export default {
       baseUrl: env.CANVAS_BASE_URL ?? "https://uc.instructure.com/api/v1",
       token: env.CANVAS_TOKEN,
     });
-    const server = createCanvasMcpServer(client);
+    const server = createCanvasMcpServer(client, {
+      shared,
+      timeZone: env.CANVAS_TIME_ZONE,
+      maxFilesPerCrawl: Number(env.MAX_FILES_PER_CRAWL ?? 0) || 0,
+    });
 
     // Stateless mode: a fresh transport per request, no session tracking.
     const transport = new WebStandardStreamableHTTPServerTransport({

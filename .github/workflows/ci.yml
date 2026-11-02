@@ -1,0 +1,89 @@
+name: CI / Deploy
+
+# - Every push and PR: typecheck, unit + tool tests, tool-list token budget.
+# - Push to main: deploy to Cloudflare Workers, then call every tool on the
+#   deployed server against the real Canvas account.
+# - Daily: re-run that live check, so an expired Canvas token or a Canvas API
+#   change is caught before it surfaces mid-conversation.
+#
+# Repository secrets:
+#   CLOUDFLARE_API_TOKEN   ("Edit Cloudflare Workers" template) - enables deploy
+#   CLOUDFLARE_ACCOUNT_ID
+#   MCP_URL                https://canvas-mcp.<subdomain>.workers.dev/mcp
+#   MCP_PASSPHRASE         the Worker's ACCESS_PASSPHRASE
+# Jobs whose secrets are missing are skipped, not failed.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  schedule:
+    - cron: "17 12 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - name: Tool list footprint
+        run: npm run footprint | tail -1 >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      HAS_CF: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Deploy to Cloudflare Workers
+        if: env.HAS_CF == 'true'
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Skipped deploy
+        if: env.HAS_CF != 'true'
+        run: echo "CLOUDFLARE_API_TOKEN not set; skipping deploy." >> "$GITHUB_STEP_SUMMARY"
+
+  live-check:
+    needs: [deploy]
+    # always() so the daily schedule (where deploy is skipped) still runs it.
+    if: always() && (needs.deploy.result == 'success' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    env:
+      HAS_MCP: ${{ secrets.MCP_URL != '' && secrets.MCP_PASSPHRASE != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Call every tool on the deployed server
+        if: env.HAS_MCP == 'true'
+        run: npm run check:remote | tee live.txt && tail -1 live.txt >> "$GITHUB_STEP_SUMMARY"
+        env:
+          MCP_URL: ${{ secrets.MCP_URL }}
+          MCP_PASSPHRASE: ${{ secrets.MCP_PASSPHRASE }}
+      - name: Skipped live check
+        if: env.HAS_MCP != 'true'
+        run: echo "MCP_URL / MCP_PASSPHRASE not set; skipping live check." >> "$GITHUB_STEP_SUMMARY"

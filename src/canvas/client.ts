@@ -1,3 +1,5 @@
+const USER_AGENT = "canvas-mcp/0.2 (personal read-only MCP server)";
+
 export interface CanvasClientConfig {
   baseUrl: string;
   token: string;
@@ -64,7 +66,7 @@ export class CanvasClient {
         Authorization: `Bearer ${this.token}`,
         Accept: "application/json",
         // Canvas rejects requests with no User-Agent (fetch on Workers sends none by default).
-        "User-Agent": "canvas-mcp/0.1 (personal read-only MCP server)",
+        "User-Agent": USER_AGENT,
       },
     });
 
@@ -104,7 +106,7 @@ export class CanvasClient {
     const res = await fetch(url, {
       headers: {
         Authorization: `Bearer ${this.token}`,
-        "User-Agent": "canvas-mcp/0.1 (personal read-only MCP server)",
+        "User-Agent": USER_AGENT,
       },
     });
     if (!res.ok) return { ok: false, status: res.status };
