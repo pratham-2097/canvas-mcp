@@ -25,7 +25,11 @@ export function registerSearchTool(reg: ToolRegistry, ctx: ServerContext): void 
       const courseId = await ctx.resolveCourseId(course_id);
       const { index, pendingFiles } = await ctx.indexManager.getSearchIndex(courseId, force_refresh ?? false);
       const results = index.search(query, { types, limit: limit ?? 10 });
-      const partial = pendingFiles ? `\n(Index still building: ${pendingFiles} file(s) not yet searched. Repeat the search to include more.)` : "";
+      const partial = !pendingFiles
+        ? ""
+        : ctx.indexManager.extractsFiles
+          ? `\n(Index still building: ${pendingFiles} file(s) not yet searched. Repeat the search to include more.)`
+          : `\n(File contents aren't indexed on this server (${pendingFiles} files); file names are. Read a file with get_file_text.)`;
       if (results.length === 0) return `No matches for "${query}" in course ${courseId}.${partial}`;
 
       const lines = results.map(

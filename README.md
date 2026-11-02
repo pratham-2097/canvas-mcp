@@ -173,7 +173,7 @@ Tool definitions are sent to the model on every turn, so they are kept lean:
 - **Slim `tools/list`**: `src/mcp/registry.ts` drops the SDK's `$schema`, int64 bounds, `execution`, `title` and redundant hints (~40% of each definition).
 - **Budget test**: `test/footprint.test.ts` fails CI if the tool list exceeds ~2.9k tokens or a description grows too long. Run `npm run footprint` to see the per-tool cost.
 - **Compact output**: local-time dates (`Wed Nov 4 11:59pm`), ids inline for follow-ups, no URLs in bulk lists, rubrics as one line per criterion, long files paged.
-- **Caching across requests**: course list (10 min) and search indexes (6 h, LRU of 8 courses) live at Worker module scope, so they survive the stateless per-request transport. Large courses index incrementally within a 20 s budget per call.
+- **Caching across requests**: course list (10 min) and search indexes (6 h, LRU of 8 courses) live at Worker module scope, so they survive the stateless per-request transport. On the deployed Worker, search indexes pages, assignments, announcements, discussions, the syllabus and file *names* (with `file_id`), but not file *contents*: the Workers free plan (50 subrequests, ~10 ms CPU per request) kills a request that parses a batch of PDFs (error 1102). `get_file_text` reads one file at a time and works fine. On Workers Paid, `wrangler secret put MAX_FILES_PER_CRAWL` (e.g. `40`) turns on in-file search; large courses then index incrementally across calls. Locally (stdio) file contents are always indexed.
 
 ## Known limitations
 

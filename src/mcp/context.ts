@@ -35,11 +35,13 @@ export interface ServerContext {
 export interface ContextOptions {
   shared?: SharedState;
   timeZone?: string;
+  /** Files extracted per search call; unlimited unless set (the Worker sets it). */
+  maxFilesPerCrawl?: number;
 }
 
 export function createServerContext(client: CanvasClient, options: ContextOptions = {}): ServerContext {
   const shared = options.shared ?? createSharedState();
-  const indexManager = new CourseIndexManager(client, shared.store);
+  const indexManager = new CourseIndexManager(client, shared.store, { maxFiles: options.maxFilesPerCrawl });
 
   async function listCourses(): Promise<CanvasCourse[]> {
     if (shared.courses && Date.now() - shared.courses.at < COURSE_CACHE_TTL_MS) return shared.courses.list;

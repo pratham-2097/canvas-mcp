@@ -18,10 +18,14 @@ const MAX_FILE_FETCH_BYTES = 25 * 1024 * 1024;
 const CONCURRENCY = 6;
 
 export interface CrawlOptions {
-  /** Earlier index of the same course: its extracted file text is reused instead of re-downloaded. */
-  previous?: CourseIndex;
   /** Stop starting new file extractions after this many ms; the rest stay pending for the next crawl. */
   fileBudgetMs?: number;
+  /**
+   * Most files to extract in one crawl. Cloudflare's free plan allows 50
+   * subrequests and little CPU per request, and every file costs two
+   * requests plus parsing, so the Worker sets this low.
+   */
+  maxFiles?: number;
 }
 
 type FileOutcome = { doc: IndexedDocument } | { pending: true } | { failed: true };
@@ -50,9 +54,9 @@ async function fetchAndExtractFile(client: CanvasClient, courseId: number, fileI
  * individual file ids discovered elsewhere are readable.
  *
  * Listings and page bodies are fetched concurrently; files are extracted
- * concurrently within a time budget. Files left over are counted in
- * `pending_files` and picked up by the next crawl, which reuses text already
- * extracted, so a large course is indexed incrementally instead of timing out.
+ * concurrently within a time and count budget. Files left over are kept in
+ * `pending_file_ids` and extracted by continueCrawl on later calls, so a
+ * large course is indexed incrementally instead of timing out.
  */
 export async function crawlCourse(client: CanvasClient, courseId: number, options: CrawlOptions = {}): Promise<CourseIndex> {
   const documents: IndexedDocument[] = [];
@@ -89,20 +93,20 @@ export async function crawlCourse(client: CanvasClient, courseId: number, option
 
   for (const mod of modules) {
     for (const item of mod.items ?? []) {
-      if (item.type === "File" && typeof item.content_id === "number") {
-        fileIds.add(item.content_id);
-      } else {
-        documents.push({
-          id: `module_item-${item.id}`,
-          course_id: courseId,
-          type: "module_item",
-          title: item.title,
-          html_url: item.html_url,
-          module: mod.name,
-          text: `${item.type}: ${item.title}`,
-          updated_at: now,
-        });
-      }
+      if (item.type === "File" && typeof item.content_id === "number") fileIds.add(item.content_id);
+      // File items are indexed by name too, so they stay findable (with the
+      // id get_file_text needs) even when their contents are not extracted.
+      const ref = item.type === "File" ? ` (file_id=${item.content_id})` : "";
+      documents.push({
+        id: `module_item-${item.id}`,
+        course_id: courseId,
+        type: "module_item",
+        title: item.title,
+        html_url: item.html_url,
+        module: mod.name,
+        text: `${item.type}: ${item.title}${ref}`,
+        updated_at: now,
+      });
     }
   }
 
@@ -160,21 +164,37 @@ export async function crawlCourse(client: CanvasClient, courseId: number, option
     harvestLinks(d.message);
   }
 
-  const previousFiles = new Map(
-    (options.previous?.documents ?? []).filter((d) => d.type === "file").map((d) => [d.id, d]),
-  );
+  const { docs, pending } = await extractFiles(client, courseId, [...fileIds], options);
+  documents.push(...docs);
+  return { course_id: courseId, documents, indexed_at: Date.now(), pending_file_ids: pending };
+}
+
+/**
+ * Extracts an incomplete index's pending files without re-fetching any
+ * course listings, so a continuation spends its whole request budget on files.
+ */
+export async function continueCrawl(client: CanvasClient, index: CourseIndex, options: CrawlOptions = {}): Promise<CourseIndex> {
+  const { docs, pending } = await extractFiles(client, index.course_id, index.pending_file_ids ?? [], options);
+  return { ...index, documents: [...index.documents, ...docs], pending_file_ids: pending };
+}
+
+async function extractFiles(
+  client: CanvasClient,
+  courseId: number,
+  fileIds: number[],
+  options: CrawlOptions,
+): Promise<{ docs: IndexedDocument[]; pending: number[] }> {
+  const batch = fileIds.slice(0, options.maxFiles ?? fileIds.length);
+  const pending = fileIds.slice(batch.length);
   const deadline = Date.now() + (options.fileBudgetMs ?? Number.POSITIVE_INFINITY);
-  let pending = 0;
-  const outcomes = await mapLimit([...fileIds], CONCURRENCY, async (fileId): Promise<FileOutcome> => {
-    const cached = previousFiles.get(`file-${fileId}`);
-    if (cached) return { doc: cached };
+  const docs: IndexedDocument[] = [];
+  const outcomes = await mapLimit(batch, CONCURRENCY, async (fileId): Promise<FileOutcome> => {
     if (Date.now() > deadline) return { pending: true };
     return fetchAndExtractFile(client, courseId, fileId);
   });
-  for (const outcome of outcomes) {
-    if ("doc" in outcome) documents.push(outcome.doc);
-    else if ("pending" in outcome) pending++;
-  }
-
-  return { course_id: courseId, documents, indexed_at: Date.now(), pending_files: pending };
+  outcomes.forEach((outcome, i) => {
+    if ("doc" in outcome) docs.push(outcome.doc);
+    else if ("pending" in outcome) pending.push(batch[i]!);
+  });
+  return { docs, pending };
 }

@@ -8,7 +8,10 @@ import type { ToolRegistry } from "../registry.js";
 import { courseArg } from "../shared.js";
 import { assignmentHeader, loadAssignmentWithSubmission, renderRubric } from "./assignments.js";
 
-const MAX_LINKED_FILES = 6;
+// Extracting a file is the expensive part (and on the Workers free plan a
+// handful of PDFs in one request exceeds the CPU limit), so only the first
+// few are inlined; the rest are listed by id for get_file_text.
+const MAX_EXTRACTED_FILES = 2;
 const MAX_LINKED_PAGES = 6;
 
 export function registerGatherContextTool(reg: ToolRegistry, ctx: ServerContext): void {
@@ -58,7 +61,9 @@ export function registerGatherContextTool(reg: ToolRegistry, ctx: ServerContext)
       }
 
       const links = extractLinks(assignment.description ?? "");
-      const fileIds = [...new Set(links.filter((l) => l.kind === "file" && l.fileId).map((l) => l.fileId!))].slice(0, MAX_LINKED_FILES);
+      const allFileIds = [...new Set(links.filter((l) => l.kind === "file" && l.fileId).map((l) => l.fileId!))];
+      const fileIds = allFileIds.slice(0, MAX_EXTRACTED_FILES);
+      const moreFiles = links.filter((l) => l.kind === "file" && l.fileId && !fileIds.includes(l.fileId));
       const pageLinks = links.filter((l) => l.kind === "page" && l.pageUrl).slice(0, MAX_LINKED_PAGES);
       const external = links.filter((l) => l.kind === "external");
 
@@ -84,9 +89,14 @@ export function registerGatherContextTool(reg: ToolRegistry, ctx: ServerContext)
             return `### ${link.text}\n[error: ${(err as Error).message.slice(0, 150)}]`;
           }
         }),
-        ctx.indexManager.getSearchIndex(courseId).then((r) => r.index).catch(() => null),
+        // Only an index that already exists: building one here could cost
+        // this whole bundle the Worker's per-request budget.
+        ctx.indexManager.getCachedSearchIndex(courseId).then((r) => r?.index ?? null).catch(() => null),
       ]);
-      if (files.length) sections.push(["## Linked files", ...files].join("\n\n"));
+      if (files.length) {
+        const rest = [...new Map(moreFiles.map((l) => [l.fileId, `- ${l.text} (file_id=${l.fileId}) — read with get_file_text`])).values()];
+        sections.push(["## Linked files", ...files, ...(rest.length ? [rest.join("\n")] : [])].join("\n\n"));
+      }
       if (pages.length) sections.push(["## Linked pages", ...pages].join("\n\n"));
       if (external.length) sections.push(["## External links (not scraped)", ...external.map((l) => `- ${l.text} ${l.href}`)].join("\n"));
 

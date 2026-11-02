@@ -9,6 +9,13 @@ export interface Env {
   ACCESS_PASSPHRASE: string;
   /** IANA zone for displayed dates; defaults to America/New_York. */
   CANVAS_TIME_ZONE?: string;
+  /**
+   * Files a single search call may extract into the index. Defaults to 0:
+   * on the Workers free plan (50 subrequests, ~10ms CPU per request) parsing
+   * a batch of PDFs gets the request killed (error 1102). On Workers Paid,
+   * set it to e.g. 40 to search inside file contents.
+   */
+  MAX_FILES_PER_CRAWL?: string;
 }
 
 // Module scope survives across requests within a Worker isolate, so the
@@ -79,7 +86,11 @@ export default {
       baseUrl: env.CANVAS_BASE_URL ?? "https://uc.instructure.com/api/v1",
       token: env.CANVAS_TOKEN,
     });
-    const server = createCanvasMcpServer(client, { shared, timeZone: env.CANVAS_TIME_ZONE });
+    const server = createCanvasMcpServer(client, {
+      shared,
+      timeZone: env.CANVAS_TIME_ZONE,
+      maxFilesPerCrawl: Number(env.MAX_FILES_PER_CRAWL ?? 0) || 0,
+    });
 
     // Stateless mode: a fresh transport per request, no session tracking.
     const transport = new WebStandardStreamableHTTPServerTransport({

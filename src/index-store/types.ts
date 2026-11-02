@@ -23,8 +23,8 @@ export interface CourseIndex {
   course_id: number;
   documents: IndexedDocument[];
   indexed_at: number;
-  /** Files discovered but not yet extracted (crawl time budget ran out). */
-  pending_files?: number;
+  /** Files discovered but not yet extracted (crawl budget ran out); the next crawl continues with these. */
+  pending_file_ids?: number[];
 }
 
 /** Storage interface so the in-memory implementation can be swapped for a KV-backed one later without touching callers. */
